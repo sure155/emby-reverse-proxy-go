@@ -1,9 +1,42 @@
 services:
+  app:
+    image: 'jc21/nginx-proxy-manager:latest'
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+      - '81:81'
+    environment:
+      TZ: 'Australia/Brisbane'
+      DB_MYSQL_HOST: 'db'
+      DB_MYSQL_PORT: 3306
+      DB_MYSQL_USER: 'npm'
+      DB_MYSQL_PASSWORD: 'npm'
+      DB_MYSQL_NAME: 'npm'
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+    depends_on:
+      - db
+      - emby-proxy
+
+  db:
+    image: 'jc21/mariadb-aria:latest'
+    container_name: nginx-proxy-manager-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: 'npm'
+      MYSQL_DATABASE: 'npm'
+      MYSQL_USER: 'npm'
+      MYSQL_PASSWORD: 'npm'
+      MARIADB_AUTO_UPGRADE: '1'
+    volumes:
+      - ./mysql:/var/lib/mysql
+
   emby-proxy:
     image: ghcr.io/gsy-allen/emby-proxy-go:v1.0
     container_name: emby-proxy
-    ports:
-      - "8080:8080"
-    environment:
-      - LISTEN_ADDR=:8080
     restart: unless-stopped
+    environment:
+      LISTEN_ADDR: ':8080'
