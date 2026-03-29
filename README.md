@@ -7,7 +7,7 @@
 ## 适合什么场景
 
 - 你想把多个 Emby 入口统一收口到一个反代域名下
-- 你前面已经有 Nginx Proxy Manager 或其他反向代理
+- 你前面已经有 Nginx Proxy Manager、Caddy、Traefik、Nginx 或其他能做 HTTPS 终止的反向代理
 - 你只想要一个能跑、好排错、不折腾配置的工具
 
 ## 核心能力
@@ -58,6 +58,16 @@
 ## 快速开始
 
 ### 1. 准备 `docker-compose.yml`
+
+下面的 compose 示例使用 **Nginx Proxy Manager**，因为它对大多数人最省事。但它只是示例，不是硬依赖。
+
+只要你的前置层能做到下面几件事，就可以替代 NPM：
+
+- 对外提供 `443`
+- 配置证书并强制 HTTPS
+- 把请求转发到本项目的 `:8080`
+- 正确透传 `X-Forwarded-Proto`、`X-Forwarded-Host`
+- 正确透传 WebSocket 升级头
 
 **不需要下载整个仓库。** 对大多数用户来说，只需要单独下载仓库里的 `docker-compose.yml` 文件，放到一个你准备用来部署的目录里就够了。
 
@@ -112,10 +122,10 @@ docker compose up -d
 
 - NPM 后台：`http://<宿主机IP>:81`
 - 公共入口：`80` / `443`
-- `emby-proxy` 只在 compose 内部网络暴露 `:8080`
+- `emby-proxy` 只在 compose 内部网络暴露 `:8080`，不直接对公网提供给用户访问
 - 数据目录：`./data`、`./letsencrypt`、`./mysql`
 
-### 4. 在 Nginx Proxy Manager 里配置上游
+### 4. 在 Nginx Proxy Manager 里配置上游（示例）
 
 Proxy Host 推荐配置：
 
@@ -143,7 +153,23 @@ proxy_max_temp_file_size 0;
 - 不要额外手写 `proxy_set_header Upgrade ...`
 - 一般也不需要再包一层 `location / { ... }`
 
+如果你不用 NPM，也一样：核心要求不是“必须是 NPM”，而是**前置层必须负责 HTTPS**，并把请求按原始 Host/Proto 正确转发到 `emby-proxy:8080`。
+
 如果前置代理没有正确传递 `X-Forwarded-Proto` 和 `X-Forwarded-Host`，响应里改写出来的 URL 会不对。
+
+## HTTPS 和公网暴露
+
+这个代理进程本身只监听内部明文 HTTP（默认 `:8080`），不自己做 TLS 终止。
+
+这意味着：
+
+- `emby-proxy:8080` 设计上应只在 Docker 内部网络、同机反代或其他受控内网里使用
+- 只要 `:8080` 没有直接暴露到公网，用户通常也不会直接访问它
+- 真正对外给用户访问的入口，应该由前置反代提供 `443` 和 HTTPS
+- 如果客户端到公网入口这一段仍然是明文 HTTP，Emby 的登录账号、密码、cookie、token、API key 都可能在链路上被窃听
+- Docker 内部网络或同机反代到 `:8080` 的这一跳通常可以继续用 HTTP
+
+一句话：**不是必须暴露 `:8080`，而是必须给公网入口提供 HTTPS。**
 
 ## 访问示例
 
@@ -332,15 +358,17 @@ docker compose ps
 ### 2. 健康检查通不通
 
 ```bash
-curl -i "http://<你的代理域名或IP>/health"
+curl -i "https://<你的代理域名>/health"
 ```
+
+如果你只是在本机、内网或 Docker 内部网络排查，当然也可以直接打内部 HTTP 地址；但对外给用户用时，入口应该是 HTTPS。
 
 预期：`200 OK`，响应体 `ok`
 
 ### 3. 根路径是不是误用了
 
 ```bash
-curl -i "http://<你的代理域名或IP>/"
+curl -i "https://<你的代理域名>/"
 ```
 
 预期：`400 Bad Request`
@@ -369,7 +397,7 @@ curl -i "https://proxy.example.com/http/public-emby.example.net/8096/"
 - 媒体识别是启发式的，不保证所有边界路径都完美分类
 - 只有符合条件的文本响应才会改写绝对 URL
 - 外部 URL 推断依赖 `X-Forwarded-Proto` 和 `X-Forwarded-Host`
-- Docker 镜像本身不做 TLS 终止，HTTPS 一般应该交给 NPM 或其他前置反代
+- Docker 镜像本身不做 TLS 终止，公网入口的 HTTPS 一般应该交给 NPM、Caddy、Traefik、Nginx 或其他前置反代
 
 ## 项目结构
 
