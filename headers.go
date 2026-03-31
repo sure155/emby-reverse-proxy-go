@@ -30,8 +30,6 @@ var stripRequestHeaders = []string{
 var stripResponseHeaders = []string{
 	"Server",
 	"X-Powered-By",
-	"X-Frame-Options",
-	"X-Content-Type-Options",
 }
 
 var safeContentEncodings = map[string]bool{

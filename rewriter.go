@@ -45,16 +45,35 @@ func shouldRewriteBody(contentType string) bool {
 	return false
 }
 
+func shouldRewriteEmbyResponse(t *target, contentType string) bool {
+	if !shouldRewriteBody(contentType) {
+		return false
+	}
+	path := strings.ToLower(targetRequestPath(t))
+	return path == "/" ||
+		strings.HasPrefix(path, "/emby/") ||
+		strings.HasPrefix(path, "/items") ||
+		strings.HasPrefix(path, "/users") ||
+		strings.HasPrefix(path, "/sessions") ||
+		strings.HasPrefix(path, "/system") ||
+		strings.HasPrefix(path, "/shows") ||
+		strings.HasPrefix(path, "/movies") ||
+		strings.HasPrefix(path, "/audio") ||
+		strings.HasPrefix(path, "/artists") ||
+		strings.HasPrefix(path, "/albums") ||
+		strings.HasPrefix(path, "/playlists") ||
+		strings.HasPrefix(path, "/web/")
+}
+
 var httpScheme = []byte("http://")
 var httpsScheme = []byte("https://")
 
-// rewriteBody scans for all http:// and https:// URLs in the body and
-// rewrites them to proxy URLs. This is required because the customized Emby
-// backend may emit absolute upstream URLs in JSON/HTML/XML payloads, and those
-// hard-coded paths cannot be corrected on the backend side.
+// rewriteBody scans for absolute URLs in Emby text responses and rewrites them
+// back to proxy URLs. Emby may return stream URLs on different upstream hosts,
+// so this intentionally rewrites absolute URLs without requiring them to match
+// the current request target host.
 // Uses bytes.Index for fast searching — no regex, no url.Parse per match.
 func rewriteBody(body []byte, baseURL string) []byte {
-	// Fast check: if no "http" in body at all, skip entirely.
 	if !bytes.Contains(body, []byte("http")) {
 		return body
 	}
@@ -62,25 +81,19 @@ func rewriteBody(body []byte, baseURL string) []byte {
 	var out []byte
 	i := 0
 	for i < len(body) {
-		// Use bytes.Index to find next "http://" or "https://" — this is
-		// optimized in Go runtime (uses SIMD on amd64) and far faster
-		// than our byte-at-a-time loop.
 		remaining := body[i:]
 		httpPos := bytes.Index(remaining, httpScheme)
 		httpsPos := bytes.Index(remaining, httpsScheme)
 
-		// Pick whichever comes first
 		pos := -1
 		schemeLen := 0
 		if httpPos >= 0 && (httpsPos < 0 || httpPos <= httpsPos) {
-			// "http://" found at or before "https://"
-			// But check if this is actually "https://" (httpPos points to 'h' of "https://")
 			if httpsPos >= 0 && httpsPos == httpPos {
 				pos = httpsPos
-				schemeLen = 8 // len("https://")
+				schemeLen = 8
 			} else {
 				pos = httpPos
-				schemeLen = 7 // len("http://")
+				schemeLen = 7
 			}
 		} else if httpsPos >= 0 {
 			pos = httpsPos
@@ -89,32 +102,25 @@ func rewriteBody(body []byte, baseURL string) []byte {
 
 		if pos < 0 {
 			if out == nil {
-				return body // fast path: no URLs at all
+				return body
 			}
 			out = append(out, remaining...)
 			break
 		}
 
-		// Lazy-init output buffer
 		if out == nil {
 			out = make([]byte, 0, len(body)+len(body)/8)
 		}
-
-		// Copy bytes before this URL
 		out = append(out, remaining[:pos]...)
 
-		// Find end of URL
 		urlStart := i + pos
 		urlEnd := urlStart + schemeLen
 		for urlEnd < len(body) && !isURLTerminator(body[urlEnd]) {
 			urlEnd++
 		}
 
-		// Rewrite inline — no url.Parse, no alloc
 		raw := body[urlStart:urlEnd]
-		rewritten := rewriteURLFast(raw, schemeLen, baseURL)
-		out = append(out, rewritten...)
-
+		out = append(out, rewriteURLFast(raw, schemeLen, baseURL)...)
 		i = urlEnd
 	}
 
@@ -129,25 +135,34 @@ func rewriteBody(body []byte, baseURL string) []byte {
 // schemeLen: 7 for http://, 8 for https://
 // Output: "baseURL/https/example.com/8096/path?q=1"
 func rewriteURLFast(raw []byte, schemeLen int, baseURL string) []byte {
-	// After scheme, find host[:port] boundary
 	afterScheme := raw[schemeLen:]
-	slashIdx := bytes.IndexByte(afterScheme, '/')
+	pathIdx := len(afterScheme)
+	if slashIdx := bytes.IndexByte(afterScheme, '/'); slashIdx >= 0 && slashIdx < pathIdx {
+		pathIdx = slashIdx
+	}
+	if queryIdx := bytes.IndexByte(afterScheme, '?'); queryIdx >= 0 && queryIdx < pathIdx {
+		pathIdx = queryIdx
+	}
+	if fragmentIdx := bytes.IndexByte(afterScheme, '#'); fragmentIdx >= 0 && fragmentIdx < pathIdx {
+		pathIdx = fragmentIdx
+	}
 	var hostPort, pathAndQuery []byte
-	if slashIdx >= 0 {
-		hostPort = afterScheme[:slashIdx]
-		pathAndQuery = afterScheme[slashIdx:] // includes leading /
+	if pathIdx < len(afterScheme) {
+		hostPort = afterScheme[:pathIdx]
+		pathAndQuery = afterScheme[pathIdx:]
+		if pathAndQuery[0] == '?' || pathAndQuery[0] == '#' {
+			pathAndQuery = append([]byte("/"), pathAndQuery...)
+		}
 	} else {
 		hostPort = afterScheme
 		pathAndQuery = []byte("/")
 	}
 
 	if len(hostPort) == 0 {
-		return raw // malformed, return as-is
+		return raw
 	}
 
-	// Split host and port
 	var host, portStr []byte
-	// Handle IPv6: [::1]:port
 	if hostPort[0] == '[' {
 		bracketEnd := bytes.IndexByte(hostPort, ']')
 		if bracketEnd < 0 {
@@ -172,7 +187,6 @@ func rewriteURLFast(raw []byte, schemeLen int, baseURL string) []byte {
 		return raw
 	}
 
-	// Determine port number
 	scheme := "http"
 	if schemeLen == 8 {
 		scheme = "https"
@@ -187,7 +201,6 @@ func rewriteURLFast(raw []byte, schemeLen int, baseURL string) []byte {
 		}
 	}
 
-	// Build: baseURL + "/" + scheme + "/" + host + "/" + port + pathAndQuery
 	var b strings.Builder
 	b.Grow(len(baseURL) + 1 + len(scheme) + 1 + len(host) + 1 + 5 + len(pathAndQuery))
 	b.WriteString(baseURL)
@@ -201,7 +214,6 @@ func rewriteURLFast(raw []byte, schemeLen int, baseURL string) []byte {
 	return []byte(b.String())
 }
 
-// isURLTerminator returns true for characters that end a URL in JSON/HTML/XML context.
 func isURLTerminator(c byte) bool {
 	switch c {
 	case '"', '\'', '<', '>', ' ', '\t', '\n', '\r', '`', '(', ')', '{', '}', '[', ']', '\\', '|', '^':
@@ -210,7 +222,6 @@ func isURLTerminator(c byte) bool {
 	return false
 }
 
-// rewriteSingleURL is used only for Location/Content-Location headers (few calls).
 func rewriteSingleURL(rawURL, baseURL string) string {
 	var schemeLen int
 	if strings.HasPrefix(rawURL, "https://") {
@@ -220,6 +231,5 @@ func rewriteSingleURL(rawURL, baseURL string) string {
 	} else {
 		return rawURL
 	}
-	result := rewriteURLFast([]byte(rawURL), schemeLen, baseURL)
-	return string(result)
+	return string(rewriteURLFast([]byte(rawURL), schemeLen, baseURL))
 }

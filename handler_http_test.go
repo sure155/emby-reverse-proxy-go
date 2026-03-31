@@ -16,6 +16,39 @@ func newUnsafeTestProxyHandler() *ProxyHandler {
 	return h
 }
 
+func newProxyRequest(method, path string) *http.Request {
+	req := httptest.NewRequest(method, path, nil)
+	req.Host = "proxy.example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	return req
+}
+
+func serveProxyRequest(t *testing.T, upstream http.HandlerFunc, requestPath string) (*httptest.ResponseRecorder, int) {
+	t.Helper()
+	server := httptest.NewServer(upstream)
+	defer server.Close()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	handler := newUnsafeTestProxyHandler()
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, newProxyRequest(http.MethodGet, "/http/127.0.0.1/"+strconv.Itoa(port)+requestPath))
+	return rr, port
+}
+
+func assertResponseStatus(t *testing.T, rr *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if rr.Code != want {
+		t.Fatalf("status = %d, want %d", rr.Code, want)
+	}
+}
+
+func assertBodyContains(t *testing.T, body, want string) {
+	t.Helper()
+	if !strings.Contains(body, want) {
+		t.Fatalf("body missing %q in %q", want, body)
+	}
+}
+
 func TestLooksLikeMedia(t *testing.T) {
 	tests := []struct {
 		path string
@@ -66,6 +99,7 @@ func TestServeHTTPBadTarget(t *testing.T) {
 }
 
 func TestServeHTTPRewriteBodyPath(t *testing.T) {
+	var port int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
 			t.Fatalf("Accept-Encoding = %q, want identity", got)
@@ -80,11 +114,11 @@ func TestServeHTTPRewriteBodyPath(t *testing.T) {
 			t.Fatalf("X-Forwarded-For = %q, want empty", got)
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_, _ = w.Write([]byte(`{"url":"https://upstream.example.com/Items/1"}`))
+		_, _ = w.Write([]byte(`{"url":"http://127.0.0.1:` + strconv.Itoa(port) + `/Items/1"}`))
 	}))
 	defer upstream.Close()
 
-	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+	port = upstream.Listener.Addr().(*net.TCPAddr).Port
 	handler := newUnsafeTestProxyHandler()
 	req := httptest.NewRequest(http.MethodGet, "/http/127.0.0.1/"+strconv.Itoa(port)+"/Items", nil)
 	req.Host = "proxy.example.com"
@@ -99,48 +133,21 @@ func TestServeHTTPRewriteBodyPath(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
 	}
-	want := `{"url":"https://proxy.example.com/https/upstream.example.com/443/Items/1"}`
+	want := `{"url":"https://proxy.example.com/http/127.0.0.1/` + strconv.Itoa(port) + `/Items/1"}`
 	if got := strings.TrimSpace(rr.Body.String()); got != want {
 		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
 
-func TestServeHTTPStreamPathAndRange(t *testing.T) {
-	payload := bytes.Repeat([]byte("a"), 32)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Range"); got != "bytes=0-15" {
-			t.Fatalf("Range = %q, want bytes=0-15", got)
-		}
-		w.Header().Set("Content-Type", "video/mp4")
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(payload)
-	}))
-	defer upstream.Close()
-
-	port := upstream.Listener.Addr().(*net.TCPAddr).Port
-	handler := newUnsafeTestProxyHandler()
-	req := httptest.NewRequest(http.MethodGet, "/http/127.0.0.1/"+strconv.Itoa(port)+"/Videos/1/stream.mp4", nil)
-	req.Header.Set("Range", "bytes=0-15")
-	rr := httptest.NewRecorder()
-
-	handler.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusPartialContent {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusPartialContent)
-	}
-	if !bytes.Equal(rr.Body.Bytes(), payload) {
-		t.Fatal("stream body mismatch")
-	}
-}
-
 func TestServeHTTPRewriteRedirectHeaders(t *testing.T) {
+	var port int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "https://upstream.example.com/web/index.html")
+		w.Header().Set("Location", "http://127.0.0.1:"+strconv.Itoa(port)+"/web/index.html")
 		w.WriteHeader(http.StatusFound)
 	}))
 	defer upstream.Close()
 
-	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+	port = upstream.Listener.Addr().(*net.TCPAddr).Port
 	handler := newUnsafeTestProxyHandler()
 	req := httptest.NewRequest(http.MethodGet, "/http/127.0.0.1/"+strconv.Itoa(port)+"/redirect", nil)
 	req.Host = "proxy.example.com"
@@ -152,9 +159,66 @@ func TestServeHTTPRewriteRedirectHeaders(t *testing.T) {
 	if rr.Code != http.StatusFound {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusFound)
 	}
-	want := "https://proxy.example.com/https/upstream.example.com/443/web/index.html"
+	want := "https://proxy.example.com/http/127.0.0.1/" + strconv.Itoa(port) + "/web/index.html"
 	if got := rr.Header().Get("Location"); got != want {
 		t.Fatalf("Location = %q, want %q", got, want)
+	}
+}
+
+func TestServeHTTPRedirectRewritesThirdPartyStreamLocation(t *testing.T) {
+	rr, _ := serveProxyRequest(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://cdn.example.com/redirect")
+		w.WriteHeader(http.StatusFound)
+	}, "/redirect")
+
+	assertResponseStatus(t, rr, http.StatusFound)
+	want := "https://proxy.example.com/https/cdn.example.com/443/redirect"
+	if got := rr.Header().Get("Location"); got != want {
+		t.Fatalf("Location = %q, want %q", got, want)
+	}
+}
+
+func TestServeHTTPRedirectNonAbsoluteLocationUntouched(t *testing.T) {
+	rr, _ := serveProxyRequest(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/web/index.html")
+		w.WriteHeader(http.StatusFound)
+	}, "/redirect")
+
+	assertResponseStatus(t, rr, http.StatusFound)
+	if got := rr.Header().Get("Location"); got != "/web/index.html" {
+		t.Fatalf("Location = %q, want %q", got, "/web/index.html")
+	}
+}
+
+func TestServeHTTPStreamPathAndRange(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), 32)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=0-15" {
+			t.Fatalf("Range = %q, want bytes=0-15", got)
+		}
+		if got := r.Header.Get("If-Range"); got != "etag-1" {
+			t.Fatalf("If-Range = %q, want etag-1", got)
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload)
+	}))
+	defer upstream.Close()
+
+	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+	handler := newUnsafeTestProxyHandler()
+	req := httptest.NewRequest(http.MethodGet, "/http/127.0.0.1/"+strconv.Itoa(port)+"/Videos/1/stream.mp4", nil)
+	req.Header.Set("Range", "bytes=0-15")
+	req.Header.Set("If-Range", "etag-1")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusPartialContent)
+	}
+	if !bytes.Equal(rr.Body.Bytes(), payload) {
+		t.Fatal("stream body mismatch")
 	}
 }
 
@@ -204,10 +268,16 @@ func TestServeHTTPRemovesSensitiveResponseHeaders(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	for _, name := range []string{"Server", "X-Powered-By", "X-Frame-Options", "X-Content-Type-Options"} {
+	for _, name := range []string{"Server", "X-Powered-By"} {
 		if got := rr.Header().Get(name); got != "" {
 			t.Fatalf("%s = %q, want empty", name, got)
 		}
+	}
+	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Fatalf("X-Frame-Options = %q, want DENY", got)
+	}
+	if got := rr.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
 	}
 }
 

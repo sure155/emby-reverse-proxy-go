@@ -2,11 +2,30 @@
 
 > **警告：不要把这个项目用于禁止反代的服务器，否则后果自负。**
 
-一个给 Emby 用的轻量反向代理。它通过路径编码上游协议、域名、端口和目标路径，把普通 HTTP、媒体流和 WebSocket 请求转发到任意 Emby 服务。
+一个给 Emby 用的轻量反向代理。它通过路径编码上游协议、域名、端口和目标路径，代理 Emby 页面/API、媒体流和 WebSocket 请求。
 
 这个项目除了适配通用 Emby，还兼容一个二次开发的 Emby 后端。那个后端会在响应头和文本响应体里返回硬编码的上游绝对 URL，这部分没法在后端修，所以代理会在响应阶段把它们改写回代理 URL。
 
+## 30 秒看懂
+
+- 这是 **Emby 专用反代**，不是通用网站反代
+- 对外入口应该是 HTTPS；本服务本身只监听内部 HTTP（默认 `:8080`）
+- 前置层要正确转发 `X-Forwarded-Proto`、`X-Forwarded-Host` 和 WebSocket 升级头
+- 访问格式固定为 `/{scheme}/{domain}/{port}/{path}`
+- 如果 Emby 主站返回了指向其他推流/分流节点的绝对 URL，代理会把它重新编码回当前代理路径
+
 ## 适合什么场景
+
+### 最小运行前提
+
+在真正开始部署前，至少要满足这几件事：
+
+- 你已经有一个 Emby 上游可以访问
+- 你前面有一层负责 HTTPS 的反向代理，或者准备自己提供 HTTPS 入口
+- 前置层能正确传递 `X-Forwarded-Proto`、`X-Forwarded-Host`
+- 如果你要用 Emby 的实时能力，前置层还必须正确透传 WebSocket 升级头
+
+满足这几点，这个代理才会按 README 里的方式工作。
 
 - 你想把多个 Emby 入口统一收口到一个反代域名下
 - 你前面已经有 Nginx Proxy Manager、Caddy、Traefik、Nginx 或其他能做 HTTPS 终止的反向代理
@@ -14,12 +33,12 @@
 
 ## 核心能力
 
-- 支持 `/{scheme}/{domain}/{port}/{path}` 格式代理任意上游 Emby
-- 改写响应头中的 `Location`、`Content-Location`
-- 改写特定文本响应中的绝对 URL
-- 自动把代理后的 `Referer`、`Origin` 还原成真实上游 URL
+- 支持 `/{scheme}/{domain}/{port}/{path}` 格式代理 Emby 上游实例
+- 改写 `Location`、`Content-Location`
+- 改写 Emby 页面/API 文本响应里的绝对 URL，让主站返回的推流/分流地址也重新走代理
+- 还原代理后的 `Referer`、`Origin`
 - 清理常见代理请求头：`X-Real-Ip`、`X-Forwarded-*`、`Forwarded`、`Via`
-- 清理部分响应头：`Server`、`X-Powered-By`、`X-Frame-Options`、`X-Content-Type-Options`
+- 移除响应头中的 `Server`、`X-Powered-By`
 - 支持媒体流透传、`Range` / `If-Range`、WebSocket
 
 ## 路径规则
@@ -56,6 +75,22 @@
 /https/emby.example.com/web/index.html   # 缺少 port
 /                                         # 根路径不是首页
 ```
+
+### 一个最值钱的改写例子
+
+假设 Emby 主站返回了一个真实推流地址：
+
+```text
+https://stream.example.com/Videos/123/master.m3u8?MediaSourceId=abc
+```
+
+客户端最终看到的会是：
+
+```text
+https://proxy.example.com/https/stream.example.com/443/Videos/123/master.m3u8?MediaSourceId=abc
+```
+
+也就是说，就算主站把播放地址指向了另一个推流/分流节点，代理也会把它重新编码回当前代理入口。
 
 ## 快速开始
 
@@ -238,7 +273,7 @@ proxy_max_temp_file_size 0;
 
 - 代理后的 `Referer`、`Origin` 会被还原成真实上游 URL
 - 发往上游时会把 `Host` 设为目标主机和端口
-- 非媒体请求会主动发 `Accept-Encoding: identity`，便于改写文本响应
+- 非媒体请求会主动发 `Accept-Encoding: identity`
 
 ### 响应侧
 
@@ -246,15 +281,14 @@ proxy_max_temp_file_size 0;
 
 - 改写 `Location`
 - 改写 `Content-Location`
-- 改写特定文本响应中的绝对 URL
+- 改写 Emby 文本响应里的绝对 URL
 - 移除 `Server`
 - 移除 `X-Powered-By`
-- 移除 `X-Frame-Options`
-- 移除 `X-Content-Type-Options`
 
 响应体改写只在下面条件同时满足时发生：
 
-1. `Content-Type` 属于以下之一：
+1. 请求路径属于 Emby 常见页面/API 范围，例如根路径、`/web/...`、`/emby/...`、`/Items`、`/Users`、`/Sessions`、`/System`
+2. `Content-Type` 属于以下之一：
    - `application/json`
    - `text/html`
    - `text/xml`
@@ -263,13 +297,20 @@ proxy_max_temp_file_size 0;
    - `application/xhtml`
    - `text/javascript`
    - `application/javascript`
-2. `Content-Encoding` 为空或为 `identity`
+3. `Content-Encoding` 为空或为 `identity`
 
-也就是说：
+常见场景包括：
+
+- `Items` / `PlaybackInfo` 返回里的 `MediaSources`、`DirectStreamUrl`、`TranscodingUrl`
+- Web 页面或脚本里写死的播放地址
+- 主站跳转到其他推流节点时返回的绝对 `Location`
+
+一句话：
 
 - 压缩响应（如 `gzip`、`br`）不会先解压再改写
 - 媒体流默认直接透传
-- 这不是通用 HTML/JSON 解析器，只是把上游绝对 URL 换回代理 URL
+- 如果 Emby 主站把播放地址指向了另一个上游 host，代理也会把它重新编码回当前代理路径
+- 非 Emby 路径下的普通文本响应不会因为里面出现一个绝对 URL 就被改写
 
 ## 媒体流和 WebSocket
 
@@ -416,21 +457,23 @@ curl -i "https://proxy.example.com/http/public-emby.example.net/8096/"
 
 ## 已知边界
 
-- 这是轻量工具，不提供复杂日志配置，也不输出 JSON 日志
+- 这是 Emby 专用轻量工具，不以通用反向代理为目标，不承诺兼容任意网站或 HTTP 应用
 - 媒体识别是启发式的，不保证所有边界路径都完美分类
-- 只有符合条件的文本响应才会改写绝对 URL
+- 只有符合条件的 Emby 文本响应才会改写绝对 URL
 - 外部 URL 推断依赖 `X-Forwarded-Proto` 和 `X-Forwarded-Host`
 - Docker 镜像本身不做 TLS 终止，公网入口的 HTTPS 一般应该交给 NPM、Caddy、Traefik、Nginx 或其他前置反代
 
 ## 项目结构
 
 ```text
-├── main.go              # 入口
-├── handler.go           # HTTP 主流程编排与响应处理
-├── headers.go           # 请求/响应头规则与辅助函数
-├── target.go            # 代理路径解析与 target 语义
-├── websocket.go         # WebSocket 透传逻辑
-├── rewriter.go          # 响应改写：URL 替换、Header 改写
-├── Dockerfile           # 多阶段构建镜像
-└── docker-compose.yml   # NPM、数据库和代理服务的一体化 Compose 部署方案
+├── main.go                           # 入口
+├── handler.go                        # HTTP 主流程编排与响应处理
+├── handler_http_test.go              # 通用 HTTP 代理测试
+├── handler_http_emby_rewrite_test.go # Emby URL 改写回归测试
+├── headers.go                        # 请求/响应头规则与辅助函数
+├── target.go                         # 代理路径解析与 target 语义
+├── websocket.go                      # WebSocket 透传逻辑
+├── rewriter.go                       # 响应改写：URL 替换、Header 改写
+├── Dockerfile                        # 多阶段构建镜像
+└── docker-compose.yml                # NPM、数据库和代理服务的一体化 Compose 部署方案
 ```

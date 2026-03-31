@@ -158,7 +158,7 @@ func (h *ProxyHandler) serveHTTPProxy(w http.ResponseWriter, r *http.Request, t 
 
 	ct := resp.Header.Get("Content-Type")
 	contentEncoding := normalizeContentEncoding(resp.Header.Get("Content-Encoding"))
-	if shouldRewriteBody(ct) && safeContentEncodings[contentEncoding] {
+	if shouldRewriteEmbyResponse(t, ct) && safeContentEncodings[contentEncoding] && responseAllowsBody(r.Method, resp.StatusCode) {
 		h.serveRewrittenBody(w, r, resp, t, baseURL)
 		log.Printf("[API] %d %s %s/%s | rewritten | %s", resp.StatusCode, r.Method, t.Domain, t.Path, time.Since(start))
 		return
@@ -224,6 +224,16 @@ func (h *ProxyHandler) serveStreamBody(w http.ResponseWriter, resp *http.Respons
 		logExpectedDisconnect(err, "%s/%s stream copy failed", t.Domain, t.Path)
 	}
 	return written
+}
+
+func responseAllowsBody(method string, statusCode int) bool {
+	if method == http.MethodHead {
+		return false
+	}
+	if statusCode >= 100 && statusCode < 200 {
+		return false
+	}
+	return statusCode != http.StatusNoContent && statusCode != http.StatusNotModified
 }
 
 func formatBytes(b int64) string {
