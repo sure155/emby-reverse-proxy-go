@@ -90,6 +90,11 @@ services:
     image: ghcr.io/gsy-allen/emby-proxy-go:v1.1
     container_name: emby-proxy
     restart: unless-stopped
+    logging:
+      driver: 'local'
+      options:
+        max-size: '10m'
+        max-file: '5'
     environment:
       LISTEN_ADDR: ':8080'
       BLOCK_PRIVATE_TARGETS: 'true'
